@@ -12,6 +12,9 @@ OUTPUT="${1:-CHANGELOG.md}"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$REPO_ROOT"
 
+# Ensure parent directory of OUTPUT exists
+mkdir -p "$(dirname "$OUTPUT")" 2>/dev/null || true
+
 # Get last tag (v* or *)
 LAST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo "")"
 if [ -z "$LAST_TAG" ]; then
@@ -31,7 +34,9 @@ for cat in Added Fixed Changed Removed; do
 done
 
 # Parse commits
-git log $RANGE --pretty=format:"%s" 2>/dev/null | while IFS= read -r subject; do
+# Note: `|| [[ -n "$subject" ]]` ensures the last line is processed even if
+# git log doesn't end with a newline.
+git log $RANGE --pretty=format:"%s" 2>/dev/null | while IFS= read -r subject || [[ -n "$subject" ]]; do
     # Strip conventional commit prefix and colon
     msg="${subject#*: }"
     [ "$msg" = "$subject" ] && msg="$subject"  # No prefix
