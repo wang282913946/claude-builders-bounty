@@ -41,24 +41,27 @@ git log $RANGE --pretty=format:"%s" 2>/dev/null | while IFS= read -r subject || 
     msg="${subject#*: }"
     [ "$msg" = "$subject" ] && msg="$subject"  # No prefix
 
-    # Categorize based on conventional commit prefix
+    # Categorize using bash case glob (more portable than [[ =~ ]] across bash versions).
+    # Glob matches at start of string, so "feat" only matches "feat" / "Feat" / "feat(scope)" — not "feature".
     case "$subject" in
-        feat*|Feat*|*feat*)
+        feat*|Feat*)
             echo "- $msg" >> "$TMPDIR/Added"
             ;;
-        fix*|Fix*|*fix*)
+        fix*|Fix*)
             echo "- $msg" >> "$TMPDIR/Fixed"
             ;;
         BREAKING*|breaking*|revert*|Revert*)
             echo "- $msg" >> "$TMPDIR/Removed"
             ;;
-        docs*|style*|refactor*|perf*|test*|chore*|build*|ci*|*)
-            # Treat as Changed unless otherwise marked
-            if [[ "$subject" =~ ^[Rr]emove ]] || [[ "$subject" =~ ^[Dd]elete ]]; then
-                echo "- $msg" >> "$TMPDIR/Removed"
-            else
-                echo "- $msg" >> "$TMPDIR/Changed"
-            fi
+        Remove*|remove*|Delete*|delete*)
+            echo "- $msg" >> "$TMPDIR/Removed"
+            ;;
+        docs*|style*|refactor*|perf*|test*|chore*|build*|ci*)
+            echo "- $msg" >> "$TMPDIR/Changed"
+            ;;
+        *)
+            # No recognizable prefix -> Changed (fallback)
+            echo "- $msg" >> "$TMPDIR/Changed"
             ;;
     esac
 done
