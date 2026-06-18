@@ -13,9 +13,33 @@ import { execSync } from "child_process";
 import { writeFileSync, readFileSync } from "fs";
 import { join } from "path";
 
+// ── Constants ────────────────────────────────────────────────────────
+const MAX_DIFF_CHARS = 120_000;       // Cap diff size to prevent OOM
+const MAX_PROMPT_CHARS = 200_000;     // Cap prompt to keep token usage sane
+const FETCH_TIMEOUT_MS = 30_000;      // 30s HTTP timeout
+const MAX_RETRIES = 3;                // 3 retries on transient errors
+const RETRY_BASE_MS = 1_500;          // 1.5s, 3s, 6s exponential backoff
+const COMMENT_MAX_CHARS = 65_000;     // GitHub PR comment hard limit (65536)
+
 // ── Helpers ──────────────────────────────────────────────────────────
 function log(...args) { console.log("[claude-review]", ...args); }
 function die(msg) { console.error("[claude-review] ERROR:", msg); process.exit(1); }
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Strip control chars and limit length; keep newlines, drop the rest.
+function sanitizeForPrompt(s) {
+  if (typeof s !== "string") return "";
+  // Drop ANSI/C0 control chars except \n \r \t; keep printable Unicode
+  // eslint-disable-next-line no-control-regex
+  return s.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+}
+
+function truncate(s, n) {
+  if (!s) return "";
+  if (s.length <= n) return s;
+  return s.slice(0, n) + `\n... [truncated ${s.length - n} chars]`;
+}
 
 // ── Parse args ───────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -57,24 +81,76 @@ if (!prUrl && !diffInput) {
   die("Missing --pr OWNER/REPO/PULL_NUMBER or --diff <diff_file>");
 }
 
+// ── Validate PR identifier (defense in depth) ───────────────────────
+if (prUrl) {
+  // Only allow alphanumeric, dash, underscore, dot, slash, and digits
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/\d{1,10}$/.test(prUrl)) {
+    die(`Invalid PR identifier: ${prUrl}`);
+  }
+  if (parseInt(prUrl.split("/")[2], 10) <= 0) {
+    die(`PR number must be positive: ${prUrl}`);
+  }
+}
+
+// ── HTTP fetch with timeout + retry on transient errors ──────────────
+async function fetchWithRetry(url, options = {}, { retries = MAX_RETRIES, timeoutMs = FETCH_TIMEOUT_MS } = {}) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timer);
+      if (resp.ok) return resp;
+      // Retry on 429/5xx
+      if ((resp.status === 429 || resp.status >= 500) && attempt < retries) {
+        const backoff = RETRY_BASE_MS * Math.pow(2, attempt);
+        const retryAfter = parseInt(resp.headers.get("retry-after") || "0", 10) * 1000;
+        const wait = Math.max(backoff, retryAfter);
+        log(`${resp.status} on ${new URL(url).pathname} (attempt ${attempt + 1}/${retries + 1}), retry in ${wait}ms`);
+        clearTimeout(timer);
+        await sleep(wait);
+        continue;
+      }
+      // 4xx (other than 429) - non-retryable
+      const body = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${body.slice(0, 500)}`);
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      const transient = e.name === "AbortError" || /fetch failed|network|ETIMEDOUT|ECONNRESET/i.test(e.message || "");
+      if (transient && attempt < retries) {
+        const backoff = RETRY_BASE_MS * Math.pow(2, attempt);
+        log(`Network error on ${new URL(url).pathname} (${e.message}), retry in ${backoff}ms`);
+        await sleep(backoff);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr || new Error("fetch failed after retries");
+}
+
 // ── Fetch PR data ────────────────────────────────────────────────────
 async function fetchJson(url) {
   const token = process.env.GITHUB_TOKEN || process.env.GITHUB_TOKEN;
   const headers = { "Accept": "application/vnd.github.v3+json" };
   if (token) headers["Authorization"] = `token ${token}`;
-  const resp = await fetch(url, { headers });
-  if (!resp.ok) throw new Error(`GitHub API ${resp.status}: ${await resp.text()}`);
+  const resp = await fetchWithRetry(url, { headers });
   return resp.json();
 }
 
 // ── Build prompt ─────────────────────────────────────────────────────
 function buildPrompt(prData, diffText) {
   const files = (prData.files || []).map(f => f.filename).join(", ");
-  const title = prData.title || "Unknown PR";
-  const body = prData.body || "(No description)";
+  const title = sanitizeForPrompt(prData.title || "Unknown PR");
+  const body = sanitizeForPrompt(prData.body || "(No description)");
   const additions = prData.additions || 0;
   const deletions = prData.deletions || 0;
   const changedFiles = prData.changed_files || 0;
+
+  // Sanitize and cap the diff
+  const safeDiff = truncate(sanitizeForPrompt(diffText), MAX_DIFF_CHARS);
 
   return `You are a senior software engineer reviewing a GitHub Pull Request.
 
@@ -86,7 +162,7 @@ function buildPrompt(prData, diffText) {
 
 ## Diff
 \`\`\`diff
-${diffText}
+${safeDiff}
 \`\`\`
 
 ## Review Instructions
@@ -155,14 +231,17 @@ Be thorough but concise. Focus on what matters: correctness, security, maintaina
 
   // Step 2: Build prompt
   const prompt = buildPrompt({ title: "", body: "", additions: 0, deletions: 0, changed_files: 0 }, diffText);
+  if (prompt.length > MAX_PROMPT_CHARS) {
+    die(`Prompt too large (${prompt.length} chars, max ${MAX_PROMPT_CHARS})`);
+  }
 
-  // Step 3: Call OpenRouter API
+  // Step 3: Call OpenRouter API with retry
   log("Calling OpenRouter API...");
   const model = process.env.CLAUDE_REVIEW_MODEL || "openai/gpt-oss-120b:free";
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) die("OPENROUTER_API_KEY environment variable is required");
 
-  const resp = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+  const resp = await fetchWithRetry("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
       "Authorization": `Bearer ${apiKey}`,
@@ -174,17 +253,12 @@ Be thorough but concise. Focus on what matters: correctness, security, maintaina
       max_tokens: 4096,
       temperature: 0.3
     })
-  });
-
-  if (!resp.ok) {
-    const err = await resp.text();
-    die(`OpenRouter API error ${resp.status}: ${err}`);
-  }
+  }, { timeoutMs: 60_000 });
 
   const data = await resp.json();
   const review = data.choices?.[0]?.message?.content;
   if (!review) die("No review generated from API");
 
-  // Step 4: Output
-  console.log(review);
+  // Step 4: Output (cap to GitHub comment limit)
+  console.log(truncate(review, COMMENT_MAX_CHARS));
 })();
